@@ -5,81 +5,161 @@ const crearSolicitud = async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const { productos, nombre_cliente, telefono_cliente } = req.body;
+    const {
+      productos,
+      nombre_cliente,
+      telefono_cliente,
+    } = req.body;
 
-    if (!nombre_cliente?.trim() || !telefono_cliente?.trim()) {
+    if (
+      !nombre_cliente?.trim() ||
+      !telefono_cliente?.trim()
+    ) {
       return res.status(400).json({
         ok: false,
         mensaje: "Nombre y teléfono son obligatorios",
       });
     }
 
-    if (!Array.isArray(productos) || productos.length === 0) {
+    if (
+      !Array.isArray(productos) ||
+      productos.length === 0
+    ) {
       return res.status(400).json({
         ok: false,
         mensaje: "Debes seleccionar al menos un producto",
       });
     }
 
-    await client.query("BEGIN");
+    // Validar estructura recibida
+    const productosNormalizados = productos.map((item) => ({
+      producto_id: Number(item.producto_id),
+      talla: String(item.talla ?? "").trim(),
+      cantidad: Number(item.cantidad),
+    }));
 
-    // Comprobar que todos existen y están disponibles
-    const resultadoProductos = await client.query(
-      `
-      SELECT id, modelo, estado
-      FROM productos
-      WHERE id = ANY($1::int[])
-      `,
-      [productos],
+    const productoInvalido = productosNormalizados.some(
+      (item) =>
+        !Number.isInteger(item.producto_id) ||
+        item.producto_id <= 0 ||
+        !item.talla ||
+        !Number.isInteger(item.cantidad) ||
+        item.cantidad <= 0
     );
 
-    if (resultadoProductos.rows.length !== productos.length) {
-      await client.query("ROLLBACK");
-
+    if (productoInvalido) {
       return res.status(400).json({
         ok: false,
-        mensaje: "Uno o más productos ya no existen",
+        mensaje:
+          "Los productos, tallas o cantidades de la solicitud no son válidos",
       });
     }
 
-    const noDisponibles = resultadoProductos.rows.filter(
-      (producto) => producto.estado !== "disponible",
+    // Evitar producto + talla repetidos
+    const claves = productosNormalizados.map(
+      (item) => `${item.producto_id}-${item.talla}`
     );
 
-    if (noDisponibles.length > 0) {
-      await client.query("ROLLBACK");
-
-      return res.status(409).json({
+    if (new Set(claves).size !== claves.length) {
+      return res.status(400).json({
         ok: false,
-        mensaje: "Uno o más productos ya no están disponibles",
-        productos: noDisponibles,
+        mensaje:
+          "No puedes repetir la misma talla del mismo producto",
       });
+    }
+
+    await client.query("BEGIN");
+
+    // Verificar producto, talla y stock actual.
+    // IMPORTANTE: todavía NO descontamos stock.
+    for (const item of productosNormalizados) {
+      const resultado = await client.query(
+        `
+          SELECT
+            p.id,
+            p.modelo,
+            p.estado,
+            pt.talla,
+            pt.stock
+          FROM productos p
+          INNER JOIN producto_tallas pt
+            ON pt.producto_id = p.id
+          WHERE p.id = $1
+            AND pt.talla = $2
+        `,
+        [item.producto_id, item.talla]
+      );
+
+      if (resultado.rowCount === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(400).json({
+          ok: false,
+          mensaje:
+            "Uno de los productos o tallas seleccionadas ya no existe",
+        });
+      }
+
+      const producto = resultado.rows[0];
+
+      if (producto.estado !== "disponible") {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          ok: false,
+          mensaje: `${producto.modelo} ya no está disponible`,
+        });
+      }
+
+      if (Number(producto.stock) < item.cantidad) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          ok: false,
+          mensaje:
+            `No hay suficiente stock de ${producto.modelo}, talla ${item.talla}. ` +
+            `Disponibles: ${producto.stock}`,
+        });
+      }
     }
 
     // Crear solicitud
     const solicitudResultado = await client.query(
       `
-  INSERT INTO solicitudes
-    (estado, nombre_cliente, telefono_cliente)
-  VALUES
-    ('pendiente', $1, $2)
-  RETURNING *
-  `,
-      [nombre_cliente.trim(), telefono_cliente.trim()],
+        INSERT INTO solicitudes
+          (estado, nombre_cliente, telefono_cliente)
+        VALUES
+          ('pendiente', $1, $2)
+        RETURNING *
+      `,
+      [
+        nombre_cliente.trim(),
+        telefono_cliente.trim(),
+      ]
     );
 
     const solicitud = solicitudResultado.rows[0];
 
-    // Relacionar productos con solicitud
-    for (const productoId of productos) {
+    // Guardar producto + talla + cantidad
+    for (const item of productosNormalizados) {
       await client.query(
         `
-        INSERT INTO solicitud_productos
-          (solicitud_id, producto_id)
-        VALUES
-          ($1, $2)
+          INSERT INTO solicitud_productos
+            (
+              solicitud_id,
+              producto_id,
+              talla,
+              cantidad
+            )
+          VALUES
+            ($1, $2, $3, $4)
         `,
-        [solicitud.id, productoId],
+        [
+          solicitud.id,
+          item.producto_id,
+          item.talla,
+          item.cantidad,
+        ]
       );
     }
 
@@ -98,6 +178,7 @@ const crearSolicitud = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: "Error creando la solicitud",
+      error: error.message,
     });
   } finally {
     client.release();
@@ -122,12 +203,14 @@ const obtenerSolicitudes = async (req, res) => {
               'id', p.id,
               'modelo', p.modelo,
               'categoria', p.categoria,
-              'talla', p.talla,
+              'talla', COALESCE(sp.talla, p.talla),
+              'cantidad', sp.cantidad,
               'imagen', p.imagen,
               'estado', p.estado
             )
+            ORDER BY sp.id
           ) FILTER (WHERE p.id IS NOT NULL),
-          '[]'
+          '[]'::json
         ) AS productos
 
       FROM solicitudes s
@@ -149,6 +232,7 @@ const obtenerSolicitudes = async (req, res) => {
     `);
 
     return res.status(200).json(resultado.rows);
+
   } catch (error) {
     console.error(
       "❌ Error obteniendo solicitudes:",
@@ -169,14 +253,18 @@ const aprobarSolicitud = async (req, res) => {
 
     await client.query("BEGIN");
 
+    // ==========================================
+    // 1. BLOQUEAR Y COMPROBAR LA SOLICITUD
+    // ==========================================
+
     const solicitudResultado = await client.query(
       `
-      SELECT *
-      FROM solicitudes
-      WHERE id = $1
-      FOR UPDATE
+        SELECT *
+        FROM solicitudes
+        WHERE id = $1
+        FOR UPDATE
       `,
-      [id],
+      [id]
     );
 
     if (solicitudResultado.rowCount === 0) {
@@ -199,62 +287,145 @@ const aprobarSolicitud = async (req, res) => {
       });
     }
 
+    // ==========================================
+    // 2. OBTENER PRODUCTOS DE LA SOLICITUD
+    // ==========================================
+
     const productosResultado = await client.query(
       `
-      SELECT p.id, p.modelo, p.estado
-      FROM productos p
-      INNER JOIN solicitud_productos sp
-        ON sp.producto_id = p.id
-      WHERE sp.solicitud_id = $1
-      FOR UPDATE
+        SELECT
+          sp.id,
+          sp.producto_id,
+          sp.talla,
+          sp.cantidad,
+          p.modelo,
+          p.estado
+        FROM solicitud_productos sp
+
+        INNER JOIN productos p
+          ON p.id = sp.producto_id
+
+        WHERE sp.solicitud_id = $1
+
+        ORDER BY sp.producto_id, sp.talla
       `,
-      [id],
+      [id]
     );
 
-    const noDisponibles = productosResultado.rows.filter(
-      (producto) => producto.estado !== "disponible",
-    );
-
-    if (noDisponibles.length > 0) {
+    if (productosResultado.rowCount === 0) {
       await client.query("ROLLBACK");
 
-      return res.status(409).json({
+      return res.status(400).json({
         ok: false,
-        mensaje: "Uno o más productos ya no están disponibles",
-        productos: noDisponibles,
+        mensaje: "La solicitud no tiene productos",
       });
     }
 
-    await client.query(
-      `
-      UPDATE productos
-      SET estado = 'apartado'
-      WHERE id IN (
-        SELECT producto_id
-        FROM solicitud_productos
-        WHERE solicitud_id = $1
-      )
-      `,
-      [id],
-    );
+    // ==========================================
+    // 3. VALIDAR Y BLOQUEAR STOCK POR TALLA
+    // ==========================================
+
+    for (const item of productosResultado.rows) {
+      /*
+        Compatibilidad con solicitudes antiguas:
+        las solicitudes creadas antes del sistema
+        de inventario pueden tener talla NULL.
+      */
+
+      if (!item.talla) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          ok: false,
+          mensaje:
+            `La solicitud #${id} es anterior al nuevo sistema de stock ` +
+            `y no tiene una talla de inventario asociada.`,
+        });
+      }
+
+      const stockResultado = await client.query(
+        `
+          SELECT
+            id,
+            producto_id,
+            talla,
+            stock
+          FROM producto_tallas
+          WHERE producto_id = $1
+            AND talla = $2
+          FOR UPDATE
+        `,
+        [item.producto_id, item.talla]
+      );
+
+      if (stockResultado.rowCount === 0) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          ok: false,
+          mensaje:
+            `No existe inventario para ${item.modelo}, talla ${item.talla}.`,
+        });
+      }
+
+      const inventario = stockResultado.rows[0];
+      const cantidadSolicitada = Number(item.cantidad);
+
+      if (Number(inventario.stock) < cantidadSolicitada) {
+        await client.query("ROLLBACK");
+
+        return res.status(409).json({
+          ok: false,
+          mensaje:
+            `Stock insuficiente para ${item.modelo}, talla ${item.talla}. ` +
+            `Solicitado: ${cantidadSolicitada}. ` +
+            `Disponible: ${inventario.stock}.`,
+        });
+      }
+    }
+
+    // ==========================================
+    // 4. DESCONTAR STOCK
+    // ==========================================
+
+    for (const item of productosResultado.rows) {
+      await client.query(
+        `
+          UPDATE producto_tallas
+          SET stock = stock - $1
+          WHERE producto_id = $2
+            AND talla = $3
+        `,
+        [
+          Number(item.cantidad),
+          item.producto_id,
+          item.talla,
+        ]
+      );
+    }
+
+    // ==========================================
+    // 5. APROBAR SOLICITUD
+    // ==========================================
 
     const resultado = await client.query(
       `
-      UPDATE solicitudes
-      SET estado = 'aprobada'
-      WHERE id = $1
-      RETURNING *
+        UPDATE solicitudes
+        SET estado = 'aprobada'
+        WHERE id = $1
+        RETURNING *
       `,
-      [id],
+      [id]
     );
 
     await client.query("COMMIT");
 
     return res.status(200).json({
       ok: true,
-      mensaje: "Solicitud aprobada correctamente",
+      mensaje: "Solicitud aprobada y stock actualizado correctamente",
       solicitud: resultado.rows[0],
     });
+
   } catch (error) {
     await client.query("ROLLBACK");
 
@@ -263,7 +434,9 @@ const aprobarSolicitud = async (req, res) => {
     return res.status(500).json({
       ok: false,
       mensaje: "Error aprobando la solicitud",
+      error: error.message,
     });
+
   } finally {
     client.release();
   }
