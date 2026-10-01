@@ -15,30 +15,51 @@ const obtenerProductos = async (req, res) => {
         p.creado_en,
 
         COALESCE(
-          json_agg(
-            json_build_object(
-              'id', pt.id,
-              'talla', pt.talla,
-              'stock', pt.stock
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', pt.id,
+                'talla', pt.talla,
+                'stock', pt.stock
+              )
+              ORDER BY pt.talla
             )
-            ORDER BY pt.talla
-          ) FILTER (WHERE pt.id IS NOT NULL),
+            FROM producto_tallas pt
+            WHERE pt.producto_id = p.id
+          ),
           '[]'::json
-        ) AS tallas
+        ) AS tallas,
+
+        COALESCE(
+          (
+            SELECT json_agg(
+              json_build_object(
+                'id', pi.id,
+                'imagen', pi.imagen,
+                'publicId', pi.imagen_public_id,
+                'orden', pi.orden
+              )
+              ORDER BY pi.orden
+            )
+            FROM producto_imagenes pi
+            WHERE pi.producto_id = p.id
+          ),
+
+          CASE
+            WHEN p.imagen IS NOT NULL THEN
+              json_build_array(
+                json_build_object(
+                  'id', NULL,
+                  'imagen', p.imagen,
+                  'publicId', p.imagen_public_id,
+                  'orden', 1
+                )
+              )
+            ELSE '[]'::json
+          END
+        ) AS imagenes
 
       FROM productos p
-
-      LEFT JOIN producto_tallas pt
-        ON pt.producto_id = p.id
-
-      GROUP BY
-        p.id,
-        p.modelo,
-        p.categoria,
-        p.talla,
-        p.imagen,
-        p.estado,
-        p.creado_en
 
       ORDER BY p.id DESC
     `);
@@ -59,13 +80,8 @@ const crearProducto = async (req, res) => {
   const client = await pool.connect();
 
   try {
-    const {
-      modelo,
-      categoria,
-      tallas,
-      imagen,
-      imagen_public_id,
-    } = req.body;
+    const { modelo, categoria, tallas, imagen, imagen_public_id, imagenes } =
+      req.body;
 
     // ================================
     // VALIDACIONES
@@ -91,10 +107,7 @@ const crearProducto = async (req, res) => {
     }));
 
     const tallaInvalida = tallasNormalizadas.some(
-      (item) =>
-        !item.talla ||
-        !Number.isInteger(item.stock) ||
-        item.stock < 0
+      (item) => !item.talla || !Number.isInteger(item.stock) || item.stock < 0,
     );
 
     if (tallaInvalida) {
@@ -105,9 +118,7 @@ const crearProducto = async (req, res) => {
       });
     }
 
-    const nombresTallas = tallasNormalizadas.map(
-      (item) => item.talla
-    );
+    const nombresTallas = tallasNormalizadas.map((item) => item.talla);
 
     const tieneDuplicadas =
       new Set(nombresTallas).size !== nombresTallas.length;
@@ -116,6 +127,41 @@ const crearProducto = async (req, res) => {
       return res.status(400).json({
         ok: false,
         mensaje: "No puedes repetir una talla en el mismo producto",
+      });
+    }
+
+    // ================================
+    // VALIDAR Y PREPARAR IMÁGENES
+    // ================================
+
+    const imagenesNormalizadas =
+      Array.isArray(imagenes) && imagenes.length > 0
+        ? imagenes.map((item, index) => ({
+            imagen: String(item.imagen ?? "").trim(),
+            publicId: item.publicId ? String(item.publicId).trim() : null,
+            orden: index + 1,
+          }))
+        : imagen
+          ? [
+              {
+                imagen: String(imagen).trim(),
+                publicId: imagen_public_id || null,
+                orden: 1,
+              },
+            ]
+          : [];
+
+    if (imagenesNormalizadas.length === 0 || imagenesNormalizadas.length > 4) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "Debes agregar entre 1 y 4 imágenes",
+      });
+    }
+
+    if (imagenesNormalizadas.some((item) => !item.imagen)) {
+      return res.status(400).json({
+        ok: false,
+        mensaje: "Todas las imágenes deben tener una URL válida",
       });
     }
 
@@ -155,9 +201,9 @@ const crearProducto = async (req, res) => {
         modelo.trim(),
         categoria,
         tallaPrincipal,
-        imagen || null,
-        imagen_public_id || null,
-      ]
+        imagenesNormalizadas[0].imagen,
+        imagenesNormalizadas[0].publicId,
+      ],
     );
 
     const producto = resultadoProducto.rows[0];
@@ -177,14 +223,24 @@ const crearProducto = async (req, res) => {
           )
           VALUES ($1, $2, $3)
         `,
-        [
-          producto.id,
-          item.talla,
-          item.stock,
-        ]
+        [producto.id, item.talla, item.stock],
       );
     }
-
+    for (const item of imagenesNormalizadas) {
+      await client.query(
+        `
+      INSERT INTO producto_imagenes
+      (
+        producto_id,
+        imagen,
+        imagen_public_id,
+        orden
+      )
+      VALUES ($1, $2, $3, $4)
+    `,
+        [producto.id, item.imagen, item.publicId, item.orden],
+      );
+    }
     await client.query("COMMIT");
 
     // ================================
@@ -193,44 +249,52 @@ const crearProducto = async (req, res) => {
 
     const resultadoFinal = await pool.query(
       `
-        SELECT
-          p.id,
-          p.modelo,
-          p.categoria,
-          p.talla,
-          p.imagen,
-          p.estado,
-          p.creado_en,
+    SELECT
+      p.id,
+      p.modelo,
+      p.categoria,
+      p.talla,
+      p.imagen,
+      p.estado,
+      p.creado_en,
 
-          COALESCE(
-            json_agg(
-              json_build_object(
-                'id', pt.id,
-                'talla', pt.talla,
-                'stock', pt.stock
-              )
-              ORDER BY pt.talla
-            ) FILTER (WHERE pt.id IS NOT NULL),
-            '[]'::json
-          ) AS tallas
+      COALESCE(
+        (
+          SELECT json_agg(
+            json_build_object(
+              'id', pt.id,
+              'talla', pt.talla,
+              'stock', pt.stock
+            )
+            ORDER BY pt.talla
+          )
+          FROM producto_tallas pt
+          WHERE pt.producto_id = p.id
+        ),
+        '[]'::json
+      ) AS tallas,
 
-        FROM productos p
+      COALESCE(
+        (
+          SELECT json_agg(
+            json_build_object(
+              'id', pi.id,
+              'imagen', pi.imagen,
+              'publicId', pi.imagen_public_id,
+              'orden', pi.orden
+            )
+            ORDER BY pi.orden
+          )
+          FROM producto_imagenes pi
+          WHERE pi.producto_id = p.id
+        ),
+        '[]'::json
+      ) AS imagenes
 
-        LEFT JOIN producto_tallas pt
-          ON pt.producto_id = p.id
-
-        WHERE p.id = $1
-
-        GROUP BY
-          p.id,
-          p.modelo,
-          p.categoria,
-          p.talla,
-          p.imagen,
-          p.estado,
-          p.creado_en
-      `,
-      [producto.id]
+    FROM productos p
+    WHERE p.id = $1
+  `,
+      [producto.id],
     );
 
     return res.status(201).json({
@@ -238,7 +302,6 @@ const crearProducto = async (req, res) => {
       mensaje: "Producto creado correctamente",
       producto: resultadoFinal.rows[0],
     });
-
   } catch (error) {
     await client.query("ROLLBACK");
 
@@ -249,7 +312,6 @@ const crearProducto = async (req, res) => {
       mensaje: "Error creando el producto",
       error: error.message,
     });
-
   } finally {
     client.release();
   }
@@ -317,12 +379,15 @@ const eliminarProducto = async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Buscar primero el producto
+    // ================================
+    // 1. BUSCAR PRODUCTO
+    // ================================
+
     const productoEncontrado = await pool.query(
       `
-      SELECT *
-      FROM productos
-      WHERE id = $1
+        SELECT *
+        FROM productos
+        WHERE id = $1
       `,
       [id],
     );
@@ -336,36 +401,86 @@ const eliminarProducto = async (req, res) => {
 
     const producto = productoEncontrado.rows[0];
 
-    // Si la imagen pertenece a Cloudinary,
-    // eliminarla primero de Cloudinary
-    if (producto.imagen_public_id) {
-      console.log(
-        "☁️ Eliminando imagen de Cloudinary:",
-        producto.imagen_public_id,
-      );
+    // ================================
+    // 2. BUSCAR TODAS SUS IMÁGENES
+    // ================================
 
-      const resultadoCloudinary = await cloudinary.uploader.destroy(
-        producto.imagen_public_id,
-      );
-
-      console.log("☁️ Resultado Cloudinary:", resultadoCloudinary);
-    }
-
-    // Eliminar producto de PostgreSQL
-    const resultado = await pool.query(
+    const imagenesEncontradas = await pool.query(
       `
-      DELETE FROM productos
-      WHERE id = $1
-      RETURNING *
+        SELECT imagen_public_id
+        FROM producto_imagenes
+        WHERE producto_id = $1
+        ORDER BY orden ASC
       `,
       [id],
     );
 
-    console.log("🗑️ Producto eliminado de PostgreSQL:", producto.modelo);
+    // Set evita intentar borrar dos veces la misma imagen
+    const publicIds = new Set(
+      imagenesEncontradas.rows
+        .map((item) => item.imagen_public_id)
+        .filter(Boolean),
+    );
+
+    // Compatibilidad con productos antiguos
+    if (producto.imagen_public_id) {
+      publicIds.add(producto.imagen_public_id);
+    }
+
+    // ================================
+    // 3. ELIMINAR PRODUCTO DE POSTGRESQL
+    // ================================
+
+    const resultado = await pool.query(
+      `
+        DELETE FROM productos
+        WHERE id = $1
+        RETURNING *
+      `,
+      [id],
+    );
+
+    console.log(
+      "🗑️ Producto eliminado de PostgreSQL:",
+      producto.modelo,
+    );
+
+    // producto_tallas y producto_imagenes
+    // se eliminan automáticamente por ON DELETE CASCADE
+
+    // ================================
+    // 4. ELIMINAR IMÁGENES DE CLOUDINARY
+    // ================================
+
+    for (const publicId of publicIds) {
+      try {
+        console.log(
+          "☁️ Eliminando imagen de Cloudinary:",
+          publicId,
+        );
+
+        const resultadoCloudinary =
+          await cloudinary.uploader.destroy(publicId);
+
+        console.log(
+          "☁️ Resultado Cloudinary:",
+          resultadoCloudinary,
+        );
+      } catch (cloudinaryError) {
+        console.error(
+          `⚠️ No se pudo eliminar ${publicId} de Cloudinary:`,
+          cloudinaryError.message,
+        );
+      }
+    }
+
+    // ================================
+    // 5. RESPUESTA
+    // ================================
 
     return res.status(200).json({
       ok: true,
-      mensaje: "Producto e imagen eliminados correctamente",
+      mensaje: "Producto e imágenes eliminados correctamente",
       producto: resultado.rows[0],
     });
   } catch (error) {
